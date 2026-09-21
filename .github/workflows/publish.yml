@@ -14,6 +14,11 @@ name: publish
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and re-sign the index even when the pool is current"
+        type: boolean
+        default: false
   schedule:
     - cron: "23 6 * * *"
 
@@ -42,6 +47,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           UPSTREAM: kbarendrecht/orchestrator
+          # Empty on a scheduled run, which is the same answer as false.
+          FORCE: ${{ inputs.force }}
         run: |
           set -e
           tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
@@ -49,8 +56,18 @@ jobs:
           deb="Orchestrator_${version}_amd64.deb"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           if [ -f "pool/main/o/orchestrator/$deb" ]; then
-            echo "changed=0" >> "$GITHUB_OUTPUT"
-            echo "the pool already carries $version"
+            # **A rebuild with no new package is what a key rotation needs.**
+            # The index is signed, so a new signing key leaves every published
+            # signature made by a key the keyring no longer carries — and
+            # nothing else in here would rewrite them, because the pool is
+            # already current. `force` re-signs what is there.
+            if [ "$FORCE" = true ]; then
+              echo "changed=1" >> "$GITHUB_OUTPUT"
+              echo "the pool carries $version; rebuilding and re-signing anyway"
+            else
+              echo "changed=0" >> "$GITHUB_OUTPUT"
+              echo "the pool already carries $version"
+            fi
             exit 0
           fi
           gh release download "$tag" --repo "$UPSTREAM" -p "$deb" -p "$deb.sha256" -D /tmp/dl
