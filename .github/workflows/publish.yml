@@ -1,0 +1,176 @@
+# Add the newest release's `.deb` to the pool, rebuild the index, sign it, and
+# prove the result installs.
+#
+# **This repository pulls; the app's release workflow pushes nothing here.** A
+# job over there would need a token that can write here, and it would sit in a
+# workflow that also runs `npx` and a bundler. Reading the public releases API
+# needs no credential, so the only secrets involved are this repository's own
+# `GITHUB_TOKEN` and the signing key, which belongs here because this is the
+# only thing that signs.
+#
+# The schedule is the floor. `mise run release` dispatches this at the end of a
+# release; the daily run covers a tag cut by hand.
+name: publish
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 6 * * *"
+
+permissions:
+  contents: write
+
+# The index is one tree that is rewritten whole. Two runs writing it at once
+# would push a `Packages` naming a pool the other run just pruned.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      # Pinned by SHA: a tag is a mutable pointer, and this job is granted
+      # `contents: write` plus the signing key.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: The tools apt's own archive is built with
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev apt-utils
+
+      - id: fetch
+        name: The newest release, if the pool does not have it
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM: kbarendrecht/orchestrator
+        run: |
+          set -e
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)
+          version=${tag#v}
+          deb="Orchestrator_${version}_amd64.deb"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ -f "pool/main/o/orchestrator/$deb" ]; then
+            echo "changed=0" >> "$GITHUB_OUTPUT"
+            echo "the pool already carries $version"
+            exit 0
+          fi
+          gh release download "$tag" --repo "$UPSTREAM" -p "$deb" -p "$deb.sha256" -D /tmp/dl
+          # **The published sum, checked against the bytes served.** The release
+          # writes one per asset; checking it here is what tells a truncated
+          # download from a good one, and it costs a line.
+          ( cd /tmp/dl && sha256sum -c "$deb.sha256" )
+          mv "/tmp/dl/$deb" pool/main/o/orchestrator/
+          echo "changed=1" >> "$GITHUB_OUTPUT"
+
+      - name: Keep the last five, and no more
+        if: steps.fetch.outputs.changed == '1'
+        run: |
+          set -e
+          # The pool lives in git history, so every release kept is 6.5 MB this
+          # repository never gives back. Five covers a rollback and a machine
+          # that pinned an older version; apt only ever installs the newest.
+          cd pool/main/o/orchestrator
+          ls -1 ./*.deb | sort -V | head -n -5 | while read -r old; do
+            echo "pruning $old"
+            git rm -q "$old"
+          done
+
+      - name: Rebuild the index
+        if: steps.fetch.outputs.changed == '1'
+        run: |
+          set -e
+          # Run from the root, so `Filename:` is the `pool/...` path apt will
+          # append to the source line rather than an absolute path on a runner.
+          dpkg-scanpackages --arch amd64 pool > dists/stable/main/binary-amd64/Packages
+          gzip -9 -c dists/stable/main/binary-amd64/Packages \
+            > dists/stable/main/binary-amd64/Packages.gz
+          # `Release` names the suite apt asked for. A `Suite`/`Codename` that
+          # disagrees with the source line is refused as a mismatch, and the
+          # message names neither — so both are `stable`, which is what the
+          # source line says.
+          apt-ftparchive release dists/stable \
+            -o APT::FTPArchive::Release::Origin=Orchestrator \
+            -o APT::FTPArchive::Release::Label=Orchestrator \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Codename=stable \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main \
+            > /tmp/Release
+          mv /tmp/Release dists/stable/Release
+
+      - name: Sign it
+        if: steps.fetch.outputs.changed == '1'
+        env:
+          KEY: ${{ secrets.APT_GPG_KEY }}
+        run: |
+          set -e
+          export GNUPGHOME=$(mktemp -d)
+          chmod 700 "$GNUPGHOME"
+          printf '%s' "$KEY" | gpg --batch --quiet --import
+          # Both, because apt accepts either and old clients only read the
+          # detached pair. `InRelease` is what a current apt fetches.
+          gpg --batch --yes --armor --detach-sign \
+            -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --clearsign \
+            -o /tmp/InRelease dists/stable/Release
+          mv /tmp/InRelease dists/stable/InRelease
+          rm -rf "$GNUPGHOME"
+
+      # **Before the push, and against a local server.** What is being checked
+      # is the tree this run built: a `Packages` that names a pruned file, a
+      # `Release` whose sums are stale, a signature over the wrong bytes. Pages
+      # would add minutes of deploy lag to every one of those answers, and the
+      # step after this one is what covers Pages itself.
+      - name: A real apt installs it
+        if: steps.fetch.outputs.changed == '1'
+        run: |
+          set -e
+          python3 -m http.server 8000 --bind 127.0.0.1 &
+          server=$!
+          trap 'kill $server' EXIT
+          for _ in $(seq 20); do
+            curl -fsS http://127.0.0.1:8000/dists/stable/InRelease > /dev/null && break
+            sleep 1
+          done
+          # A container, because the runner's own apt must not be taught about
+          # this repository — and because `install` has to resolve
+          # `libwebkit2gtk-4.1-0` against a stock Ubuntu, which is the half of
+          # the `.deb` nothing else checks.
+          docker run --rm --network host -v "$PWD:/repo:ro" ubuntu:22.04 bash -euc '
+            apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null
+            cp /repo/orchestrator.asc /usr/share/keyrings/orchestrator.asc
+            echo "deb [arch=amd64 signed-by=/usr/share/keyrings/orchestrator.asc] http://127.0.0.1:8000 stable main" \
+              > /etc/apt/sources.list.d/orchestrator.list
+            apt-get update
+            apt-get install -y orchestrator
+            test -x /usr/bin/orch
+            test -x /usr/bin/orchd
+            test -x /usr/bin/orchestrator-desktop
+            orch --help > /dev/null
+          '
+
+      - name: Push
+        if: steps.fetch.outputs.changed == '1'
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "orchestrator ${{ steps.fetch.outputs.version }}"
+          git push
+
+      # Pages is the URL people actually put in a source line, and it is a
+      # separate deployment that can lag or fail on its own. Fetching the
+      # signature back is the cheapest proof that it served this run's tree.
+      - name: Pages is serving it
+        if: steps.fetch.outputs.changed == '1'
+        run: |
+          set -e
+          want=$(sha256sum dists/stable/InRelease | cut -d' ' -f1)
+          for _ in $(seq 30); do
+            got=$(curl -fsS https://kbarendrecht.github.io/apt/dists/stable/InRelease \
+                    | sha256sum | cut -d' ' -f1) || got=
+            [ "$got" = "$want" ] && { echo "pages is current"; exit 0; }
+            sleep 20
+          done
+          echo "::error::pages has not served this run's InRelease in 10 minutes"
+          exit 1
