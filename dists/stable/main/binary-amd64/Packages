@@ -1,14 +1,14 @@
 Package: orchestrator
-Version: 2026.9.26
+Version: 2026.9.27
 Architecture: amd64
 Maintainer: Kars Barendrecht <18546657+kbarendrecht@users.noreply.github.com>
-Installed-Size: 44429
+Installed-Size: 44435
 Depends: libwebkit2gtk-4.1-0, libgtk-3-0, libwebkit2gtk-4.1-0, libgtk-3-0
-Filename: pool/main/o/orchestrator/Orchestrator_2026.9.26_amd64.deb
-Size: 13332666
-MD5sum: 6281cc06da32fd92557e90b17dcf0f36
-SHA1: 8b54d25dc5a47dcd47278df9688f30ac3e6ae95b
-SHA256: 58dba3a2911b822a23d5eeb64d0107e52c03a4c49cfefc1e4be93961e2e229ee
+Filename: pool/main/o/orchestrator/Orchestrator_2026.9.27_amd64.deb
+Size: 13333140
+MD5sum: c60d702b2e94c038ce0d9ab143d18f45
+SHA1: 963d888deedf42df089ec90c6871dc4c5ccba574
+SHA256: e365dfba557ad0248c56846694896f538fc2abc48e8cb8219b976320631b8b9e
 Priority: optional
 Description: Session board for parallel Claude work
  Hosts several Claude Code sessions over one monorepo: a rail of what needs you, a terminal per session, the changed files beside it, and the PRs they end up on.
